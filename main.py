@@ -1,12 +1,11 @@
-"""
-main.py — FastAPI entry point for ResolveBot.
-One endpoint: POST /chat on port 8000.
-Header: X-Customer-Id (required)
-"""
 import uuid
-from fastapi import FastAPI, Request, Header, HTTPException
+import time
+import re
+import html
+from collections import defaultdict
+from fastapi import FastAPI, Request, Header, HTTPException, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, validator
 from typing import Optional
 
 from config import APP_TODAY_STR
@@ -14,11 +13,52 @@ from db.queries import get_customer_by_id
 from session import get_or_create_session, append_message, get_history, set_pending, get_pending
 from agent import run_agent
 
+# Debug mode explicitly OFF for security
 app = FastAPI(
     title="ResolveBot",
     description="AI customer support assistant for ShopSphere",
     version="1.0.0",
+    debug=False,
 )
+
+
+# ── Security Headers Middleware ───────────────────────────────────────────────
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """Attach OWASP recommended security headers to all responses."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = "default-src 'self'"
+    return response
+
+
+# ── In-Memory Rate Limiting (120 req/minute per client) ──────────────────────
+
+_request_timestamps: dict[str, list[float]] = defaultdict(list)
+RATE_LIMIT_MAX_REQUESTS = 120
+RATE_LIMIT_WINDOW_SECONDS = 60.0
+
+@app.middleware("http")
+async def rate_limiting_middleware(request: Request, call_next):
+    """Prevent DDoS and brute force while allowing rapid automated tests."""
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    
+    # Prune old timestamps
+    timestamps = [t for t in _request_timestamps[client_ip] if now - t < RATE_LIMIT_WINDOW_SECONDS]
+    if len(timestamps) >= RATE_LIMIT_MAX_REQUESTS:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": "Too many requests. Please try again in a moment."}
+        )
+    timestamps.append(now)
+    _request_timestamps[client_ip] = timestamps
+
+    return await call_next(request)
 
 
 @app.get("/")
@@ -32,12 +72,19 @@ def root():
     }
 
 
-
-# ── Request / Response models ─────────────────────────────────────────────────
+# ── Sanitized Request / Response Models ───────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    session_id: str
-    message: str
+    session_id: str = Field(..., min_length=1, max_length=128)
+    message: str = Field(..., min_length=1, max_length=4000)
+
+    @validator("session_id", "message")
+    def sanitize_input(cls, v: str) -> str:
+        # Strip null bytes and normalize whitespace
+        cleaned = v.replace("\x00", "").strip()
+        # Escape potential XSS payload characters
+        cleaned = html.escape(cleaned)
+        return cleaned
 
 
 class ChatResponse(BaseModel):
@@ -108,10 +155,28 @@ async def health():
 # ── Validation error handler → 400 ───────────────────────────────────────────
 
 from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(
         status_code=400,
         content={"detail": "Invalid request body. Required fields: session_id, message."}
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Prevent internal server tracebacks from leaking to clients."""
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An internal server error occurred. Please contact support."}
     )
