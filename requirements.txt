@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+python-dateutil
+python-dotenv
+openai
+google-generativeai
+anthropic
