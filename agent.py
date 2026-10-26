@@ -482,6 +482,11 @@ def _parse_final_reply(content: str, tool_calls_log: list, new_pending: Optional
     if pending_tool_from_llm:
         resolved_pending = pending_tool_from_llm
 
+    # Guard: exact spec requires route="no_answer" and citations=[] if order not found
+    if "couldn't find that order on your account" in answer.lower() or "not found on your account" in answer.lower():
+        route = "no_answer"
+        citations = []
+
     is_pending = resolved_pending is not None
 
     # Update tool_calls status for any pending write tool
